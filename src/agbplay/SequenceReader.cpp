@@ -462,7 +462,12 @@ void SequenceReader::cmdPlayNote(MP2KPlayer &player, MP2KTrack &trk, uint8_t cmd
         sinfo.samplePos = samplePos;
         sinfo.samplePtr = static_cast<const int8_t *>(rom.GetPtr(samplePos + 16));
 
-        ctx.sndChannels.emplace_back(ctx, &trk, sinfo, adsr, note, instrType & BANKDATA_TYPE_FIX);
+        /* BANKDATA_TYPE_DPCM_REVERSE (0x30) is BANKDATA_TYPE_PCM_REVERSE (0x10) combined with the
+         * "compressed" bit (0x20); checking the PCM_REVERSE bit alone covers both cases without
+         * misfiring on plain compressed (0x20) instruments. */
+        const bool reverse = (instrType & BANKDATA_TYPE_PCM_REVERSE) != 0;
+
+        ctx.sndChannels.emplace_back(ctx, &trk, sinfo, adsr, note, instrType & BANKDATA_TYPE_FIX, reverse);
         chn = &ctx.sndChannels.back();
     }
 

@@ -16,8 +16,10 @@
  * public MP2KChnPCM
  */
 
-MP2KChnPCM::MP2KChnPCM(MP2KContext &ctx, MP2KTrack *track, SampleInfo sInfo, ADSR env, const Note &note, bool fixed) :
-    MP2KChn(track, note, env), ctx(ctx), sInfo(sInfo), fixed(fixed)
+MP2KChnPCM::MP2KChnPCM(
+    MP2KContext &ctx, MP2KTrack *track, SampleInfo sInfo, ADSR env, const Note &note, bool fixed, bool reverse
+) :
+    MP2KChn(track, note, env), ctx(ctx), sInfo(sInfo), fixed(fixed), reverse(reverse)
 {
     if (sInfo.loopPos == 0 && sInfo.endPos == 0) {
         if (!ctx.rom.ValidRange(sInfo.samplePos, 16 + 8)) {
@@ -68,6 +70,11 @@ MP2KChnPCM::MP2KChnPCM(MP2KContext &ctx, MP2KTrack *track, SampleInfo sInfo, ADS
             return;
         }
     }
+
+    /* Reverse playback starts at the last sample and works its way back towards the loop point
+     * (or the start of the sample if looping is disabled), mirroring the forward playback logic. */
+    if (reverse && (type == Type::PCM || type == Type::GAMEFREAK_DPCM))
+        pos = sInfo.endPos - 1;
 }
 
 void MP2KChnPCM::Process(std::span<sample> buffer, const MixingArgs &args)
@@ -438,6 +445,30 @@ bool MP2KChnPCM::sampleFetchCallback(std::vector<float> &fetchBuffer, size_t sam
     size_t i = fetchBuffer.size();
     fetchBuffer.resize(samplesRequired);
 
+    if (reverse) {
+        do {
+            size_t samplesTilLoop = pos - sInfo.loopPos + 1;
+            size_t thisFetch = std::min(samplesTilLoop, samplesToFetch);
+
+            samplesToFetch -= thisFetch;
+            size_t remaining = thisFetch;
+            do {
+                fetchBuffer[i++] = float(sInfo.samplePtr[pos]) / 128.0f;
+                pos--;
+            } while (--remaining > 0);
+
+            if (thisFetch == samplesTilLoop) {
+                if (sInfo.loopEnabled) {
+                    pos = sInfo.endPos - 1;
+                } else {
+                    std::fill(fetchBuffer.begin() + i, fetchBuffer.end(), 0.0f);
+                    return false;
+                }
+            }
+        } while (samplesToFetch > 0);
+        return true;
+    }
+
     do {
         size_t samplesTilLoop = sInfo.endPos - pos;
         size_t thisFetch = std::min(samplesTilLoop, samplesToFetch);
@@ -471,33 +502,61 @@ bool MP2KChnPCM::sampleFetchCallbackGFDPCMDecomp(std::vector<float> &fetchBuffer
     std::array<int8_t, DPCM_BLOCK_SIZE> decodeBuffer;
     size_t decodedBlockIdx = ~static_cast<size_t>(0);
 
+    auto decodeBlockIfNeeded = [&](size_t currentBlock) {
+        if (decodedBlockIdx == currentBlock) [[likely]]
+            return;
+
+        static const std::array<int8_t, 16> deltaTable = {
+            0, 1, 4, 9, 16, 25, 36, 49, -64, -49, -36, -25, -16, -9, -4, -1
+        };
+
+        const size_t currentBlockPos = currentBlock * 0x21;
+
+        int8_t acc = sInfo.samplePtr[currentBlockPos];
+        decodeBuffer[0] = acc;
+        acc += deltaTable[sInfo.samplePtr[currentBlockPos + 1] & 0xF];
+        decodeBuffer[1] = acc;
+        for (size_t j = 2, h = 2; j < DPCM_BLOCK_SIZE; j += 2, h++) {
+            acc += deltaTable[(sInfo.samplePtr[currentBlockPos + h] & 0xF0) >> 4];
+            decodeBuffer[j + 0] = acc;
+            acc += deltaTable[sInfo.samplePtr[currentBlockPos + h] & 0xF];
+            decodeBuffer[j + 1] = acc;
+        }
+        decodedBlockIdx = currentBlock;
+    };
+
+    if (reverse) {
+        do {
+            size_t samplesTilLoop = pos - sInfo.loopPos + 1;
+            size_t thisFetch = std::min(samplesTilLoop, samplesToFetch);
+
+            samplesToFetch -= thisFetch;
+            size_t remaining = thisFetch;
+            do {
+                decodeBlockIfNeeded(pos / DPCM_BLOCK_SIZE);
+                fetchBuffer[i++] = static_cast<float>(decodeBuffer[pos % DPCM_BLOCK_SIZE]) / 128.0f;
+                pos--;
+            } while (--remaining > 0);
+
+            if (thisFetch == samplesTilLoop) {
+                if (sInfo.loopEnabled) {
+                    pos = sInfo.endPos - 1;
+                } else {
+                    std::fill(fetchBuffer.begin() + i, fetchBuffer.end(), 0.0f);
+                    return false;
+                }
+            }
+        } while (samplesToFetch > 0);
+        return true;
+    }
+
     do {
         size_t samplesTilLoop = sInfo.endPos - pos;
         size_t thisFetch = std::min(samplesTilLoop, samplesToFetch);
 
         samplesToFetch -= thisFetch;
         do {
-            const size_t currentBlock = pos / DPCM_BLOCK_SIZE;
-            if (decodedBlockIdx != currentBlock) [[unlikely]] {
-                static const std::array<int8_t, 16> deltaTable = {
-                    0, 1, 4, 9, 16, 25, 36, 49, -64, -49, -36, -25, -16, -9, -4, -1
-                };
-
-                const size_t currentBlockPos = currentBlock * 0x21;
-
-                int8_t acc = sInfo.samplePtr[currentBlockPos];
-                decodeBuffer[0] = acc;
-                acc += deltaTable[sInfo.samplePtr[currentBlockPos + 1] & 0xF];
-                decodeBuffer[1] = acc;
-                for (size_t j = 2, h = 2; j < DPCM_BLOCK_SIZE; j += 2, h++) {
-                    acc += deltaTable[(sInfo.samplePtr[currentBlockPos + h] & 0xF0) >> 4];
-                    decodeBuffer[j + 0] = acc;
-                    acc += deltaTable[sInfo.samplePtr[currentBlockPos + h] & 0xF];
-                    decodeBuffer[j + 1] = acc;
-                }
-                decodedBlockIdx = currentBlock;
-            }
-
+            decodeBlockIfNeeded(pos / DPCM_BLOCK_SIZE);
             fetchBuffer[i++] = static_cast<float>(decodeBuffer[pos++ % DPCM_BLOCK_SIZE]) / 128.0f;
         } while (--thisFetch > 0);
 

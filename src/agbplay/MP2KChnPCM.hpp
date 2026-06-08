@@ -23,7 +23,9 @@ private:
     };
 
 public:
-    MP2KChnPCM(MP2KContext &ctx, MP2KTrack *track, SampleInfo sInfo, ADSR env, const Note &note, bool fixed);
+    MP2KChnPCM(
+        MP2KContext &ctx, MP2KTrack *track, SampleInfo sInfo, ADSR env, const Note &note, bool fixed, bool reverse
+    );
     MP2KChnPCM(const MP2KChnPCM &) = delete;
     MP2KChnPCM &operator=(const MP2KChnPCM &) = delete;
 
@@ -60,6 +62,7 @@ private:
     MP2KContext &ctx;
     SampleInfo sInfo;
     bool fixed;
+    bool reverse;
     bool isSynth = false;
     int16_t levelMPTcompressed = 0;
     uint8_t shiftMPTcompressed = 0x38;
